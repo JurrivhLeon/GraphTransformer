@@ -238,6 +238,110 @@ def verify_recursive_solution(N: int, state_to_move: Dict[TowerOfHanoiState, Tup
     print(f"\nTotal moves in optimal solution: {2**N - 1}")
 
 
+class HanoiNextStateGenerator:
+    """Generates training data for Tower of Hanoi state prediction."""
+    def __init__(self, N: int, noise_rate: float = 0.1, method: str = 'bfs'):
+        """
+        Initialize the dataset generator.
+        
+        Args:
+            N: Number of disks
+            noise_rate: Probability mass to distribute among non-optimal moves
+            method: 'bfs' for all states (3^N), 'recursive' for optimal path (2^N)
+        """
+        self.N = N
+        self.noise_rate = noise_rate
+        self.method = method
+        # Pre-compute optimal moves for all reachable states
+        print(f"Pre-computing optimal moves using {method} method...")
+        if method == 'bfs':
+            self.state_to_move = generate_all_states_BFS(N)
+            print(f"Generated {len(self.state_to_move)} states (all reachable)")
+        elif method == 'recursive':
+            self.state_to_move = generate_states_recursive(N, start_rod=0, target_rod=2)
+            print(f"Generated {len(self.state_to_move)} states (optimal path)")
+        else:
+            raise ValueError(f"Unknown method: {method}. Use 'bfs' or 'recursive'")
+    
+    def get_optimal_move(self, state: TowerOfHanoiState) -> Tuple[int, int]:
+        """Get the optimal move for a given state."""
+        if state not in self.state_to_move:
+            raise ValueError("State not in pre-computed optimal moves")
+        move = self.state_to_move[state]
+        if move is None:
+            raise ValueError("State is already at target (no move needed)")
+        return move
+    
+    def create_noisy_target(self, state: TowerOfHanoiState, teacher_move: Tuple[int, int]) -> np.ndarray:
+        """Create noisy target distribution as described in the paper."""
+        legal_moves = state.get_legal_moves()
+        if not legal_moves:
+            return target  # No legal moves
+        
+        # Teacher move probability (One-hot encoding of the new state)
+        teacher_state = state.make_move(teacher_move[0], teacher_move[1])
+        target = np.eye(3, dtype=np.int64)[teacher_state.state] * (1.0 - self.noise_rate)  # [N, 3]
+        
+        # Distribute remaining probability among other legal moves
+        other_legal_moves = [move for move in legal_moves if move != teacher_move]
+        if other_legal_moves:
+            noise_prob_per_move = self.noise_rate / len(other_legal_moves)
+            for from_rod, to_rod in other_legal_moves:
+                other_state = state.make_move(from_rod, to_rod)
+                target += np.eye(3, dtype=np.int64)[other_state.state] * noise_prob_per_move  # [N, 3]
+        
+        return target
+    
+    def generate_dataset(self, num_samples: int, target_rod: int = 2, 
+                        use_all_states: bool = False) -> List[Dict]:
+        """
+        Generate training dataset.
+        
+        Args:
+            num_samples: Number of samples to generate
+            target_rod: Target rod (default: 2)
+            use_all_states: If True, use all pre-computed non-target states.
+                           If False, randomly sample num_samples states.
+        
+        Returns:
+            List of training samples, each containing:
+                - state: The current state array
+                - teacher_move: The optimal move
+                - noisy_target: The noisy probability distribution
+                - legal_moves: All legal moves from this state
+        """
+        # Get all non-target states (states that have a move to make)
+        available_states = [s for s in self.state_to_move.keys() if self.state_to_move[s] is not None]
+        
+        if use_all_states:
+            # Use all available states
+            states_to_use = available_states
+        else:
+            # Randomly sample from available states
+            if num_samples > len(available_states):
+                print(f"Warning: Requested {num_samples} samples but only {len(available_states)} "
+                      f"states available. Using all available states.")
+                states_to_use = available_states
+            else:
+                # Sample without replacement
+                sampled_indices = np.random.choice(len(available_states), size=num_samples, replace=False)
+                states_to_use = [available_states[i] for i in sampled_indices]
+        
+        # Generate dataset
+        dataset = []
+        for state in states_to_use:
+            teacher_move = self.get_optimal_move(state)
+            noisy_target = self.create_noisy_target(state, teacher_move)
+            sample = {
+                'state': state.state.copy(),
+                'teacher_move': teacher_move,
+                'noisy_target': noisy_target,
+                'legal_moves': state.get_legal_moves()
+            }
+            dataset.append(sample)
+        
+        return dataset
+
 class HanoiDatasetGenerator:
     """Generates training data for Tower of Hanoi."""
     
@@ -345,6 +449,24 @@ class HanoiDatasetGenerator:
         return dataset
 
 
+class HanoiNextStateDataset(Dataset):
+    """PyTorch Dataset for Tower of Hanoi next state prediction."""
+    def __init__(self, data: List[Dict]):
+        self.data = data
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        sample = self.data[idx]
+        return {
+            'state': torch.tensor(sample['state'], dtype=torch.long),
+            'teacher_move': torch.tensor(sample['teacher_move'], dtype=torch.long),
+            'noisy_target': torch.tensor(sample['noisy_target'], dtype=torch.float32) if sample['noisy_target'] is not None else None,
+            'legal_moves': sample['legal_moves']  # Keep as list for now
+        }
+
+
 class HanoiDataset(Dataset):
     """PyTorch Dataset for Tower of Hanoi."""
     def __init__(self, data: List[Dict]):
@@ -361,6 +483,51 @@ class HanoiDataset(Dataset):
             'noisy_target': torch.tensor(sample['noisy_target'], dtype=torch.float32),
             'legal_moves': sample['legal_moves']  # Keep as list for now
         }
+
+
+def hanoi_next_state_collate_fn(batch: List[Dict]) -> Dict:
+    """
+    Collate function for batching Tower of Hanoi next state samples with variable N.
+    
+    Pads state sequences to the length of the longest sequence in the batch.
+    Uses padding value of -1 (since valid values are 0, 1, 2).
+    
+    Args:
+        batch: List of samples from HanoiNextStateDataset
+        
+    Returns:
+        Batched dictionary with:
+            - state: [batch_size, max_N] padded tensor
+            - next_state: [batch_size, max_N] padded tensor
+            - lengths: [batch_size] tensor with original sequence lengths
+            - noisy_target: [batch_size, 3] tensor (for moved disk only)
+            - moved_disk: [batch_size] tensor with moved disk indices
+            - teacher_move: [batch_size, 2] tensor
+            - legal_moves: List of legal moves for each sample
+    """
+    # Extract components
+    states = [sample['state'] for sample in batch]
+    teacher_moves = [sample['teacher_move'] for sample in batch]
+    legal_moves = [sample['legal_moves'] for sample in batch]
+    noisy_targets = [sample['noisy_target'] for sample in batch]
+    
+    # Get original lengths before padding
+    lengths = torch.tensor([len(state) for state in states], dtype=torch.long)
+    # Pad states to max length in batch (padding value = -1)
+    states_padded = pad_sequence(states, batch_first=True, padding_value=-1)
+    # Stack teacher moves (these have fixed dimensions)
+    teacher_moves_batch = torch.stack(teacher_moves, dim=0)
+    
+    # Handle noisy targets
+    noisy_targets_padded = pad_sequence(noisy_targets, batch_first=True, padding_value=0)
+    
+    return {
+        'state': states_padded,           # [batch_size, max_N]
+        'lengths': lengths,                # [batch_size]
+        'teacher_move': teacher_moves_batch,  # [batch_size, 2]
+        'noisy_target': noisy_targets_padded,  # [batch_size, max_N, 3]
+        'legal_moves': legal_moves         # List of lists
+    }
 
 
 def hanoi_collate_fn(batch: List[Dict]) -> Dict:
@@ -450,7 +617,7 @@ def generate_complete_dataset(N_min: int = 3, N_max: int = 10, noise_rate: float
         start_time = time.time()
         
         # Generate dataset for this N
-        generator = HanoiDatasetGenerator(N=N, noise_rate=noise_rate, method=method)
+        generator = HanoiNextStateGenerator(N=N, noise_rate=noise_rate, method=method)
         dataset = generator.generate_dataset(num_samples=None, use_all_states=True)
         
         # Add N to each sample for later reference
@@ -604,7 +771,7 @@ if __name__ == "__main__":
     dataloader = DataLoader(
         dataset_all, 
         batch_size=32, 
-        collate_fn=hanoi_collate_fn,
+        collate_fn=hanoi_next_state_collate_fn,
         shuffle=True
     )
     
